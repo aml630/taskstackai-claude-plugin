@@ -1,0 +1,39 @@
+{
+  "name": "TaskTrackAi",
+  "description": "SaaS issue tracker for multi-session AI coding workflows. Manage tasks, dependencies, and team collaboration via the TaskTrackAi API.",
+  "version": "0.1.0",
+  "author": { "name": "TaskTrackAi" },
+  "repository": "https://github.com/aml630/TaskTrackAi",
+  "license": "MIT",
+  "keywords": [
+    "issue-tracker",
+    "task-management",
+    "ai-workflow",
+    "saas",
+    "team-collaboration"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DIR}/bin/taskstackai prime"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_DIR}/bin/taskstackai prime"
+          }
+        ]
+      }
+    ]
+  }
+}

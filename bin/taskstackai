@@ -1,0 +1,2752 @@
+#!/usr/bin/env bash
+# taskstackai - TaskStackAi CLI
+# Wraps curl calls to the TaskStackAi REST API for Claude Code integration.
+# Config: .taskstackai/config in project root (shell-sourceable key=value)
+
+set -euo pipefail
+
+TASKSTACKAI_VERSION="0.1.0"
+
+# ── Config discovery ─────────────────────────────────────────────────────────
+
+_find_config() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" && "$dir" != "" ]]; do
+        if [[ -f "$dir/.taskstackai/config" ]]; then
+            echo "$dir/.taskstackai/config"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+_load_config() {
+    local config
+    if config=$(_find_config); then
+        # shellcheck source=/dev/null
+        source "$config"
+    else
+        if [[ "${1:-}" != "init" && "${1:-}" != "setup" && "${1:-}" != "remove" && "${1:-}" != "version" && "${1:-}" != "help" && "${1:-}" != "--help" ]]; then
+            echo "Error: No .taskstackai/config found. Run 'taskstackai setup' first." >&2
+            exit 1
+        fi
+    fi
+}
+
+_config_dir() {
+    local config
+    if config=$(_find_config); then
+        dirname "$config"
+    else
+        echo ".taskstackai"
+    fi
+}
+
+# ── Project context ──────────────────────────────────────────────────────────
+
+_resolve_project_id() {
+    # Accept --project flag override, fall back to config
+    local project_id="${1:-${TASKSTACKAI_PROJECT_ID:-}}"
+    if [[ -z "$project_id" ]]; then
+        echo "Error: No active project. Set TASKSTACKAI_PROJECT_ID in .taskstackai/config or use --project <id>." >&2
+        return 1
+    fi
+    echo "$project_id"
+}
+
+# ── API helpers ──────────────────────────────────────────────────────────────
+
+_api() {
+    local method="$1" path="$2"
+    shift 2
+    local server="${TASKSTACKAI_SERVER:-https://taskstackai.com}"
+    local url="${server}/api/v1${path}"
+    local -a curl_args=(
+        -s -S
+        -X "$method"
+        -H "Authorization: Bearer ${TASKSTACKAI_API_KEY}"
+        -H "Content-Type: application/json"
+        -H "Accept: application/json"
+        --fail-with-body
+    )
+    curl "${curl_args[@]}" "$@" "$url" 2>/dev/null || {
+        local code=$?
+        echo "Error: API request failed (curl exit $code)" >&2
+        return 1
+    }
+}
+
+_get()    { _api GET    "$@"; }
+_post()   { _api POST   "$@"; }
+_patch()  { _api PATCH  "$@"; }
+_delete() { _api DELETE "$@"; }
+
+# JSON formatting - use jq if available, otherwise cat
+_jq() {
+    if command -v jq &>/dev/null; then
+        jq "$@"
+    else
+        cat
+    fi
+}
+
+# ── Status/Priority formatting ───────────────────────────────────────────────
+
+_status_icon() {
+    case "${1:-}" in
+        open)        echo "○" ;;
+        in_progress) echo "◐" ;;
+        closed)      echo "✓" ;;
+        deferred)    echo "❄" ;;
+        blocked)     echo "●" ;;
+        *)           echo "?" ;;
+    esac
+}
+
+_priority_label() {
+    case "${1:-}" in
+        0) echo "P0" ;;
+        1) echo "P1" ;;
+        2) echo "P2" ;;
+        3) echo "P3" ;;
+        4) echo "P4" ;;
+        *) echo "P?" ;;
+    esac
+}
+
+_format_issue_line() {
+    # Expects JSON object on stdin
+    _jq -r '"'"$(_status_icon "$(echo)" )"' (.status | if . == "open" then "○" elif . == "in_progress" then "◐" elif . == "closed" then "✓" elif . == "deferred" then "❄" else "●" end) + " " + .id + " ● P" + (.priority|tostring) + " " + .type + " " + .title'
+}
+
+_format_issues_table() {
+    # Expects JSON array on stdin
+    _jq -r '.[] | (.status | if . == "open" then "○" elif . == "in_progress" then "◐" elif . == "closed" then "✓" elif . == "deferred" then "❄" else "●" end) + " " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title'
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+cmd_init() {
+    # MVP: init is now an alias for setup
+    cmd_setup "$@"
+}
+
+cmd_prime() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    echo "# TaskStackAi Workflow Context"
+    echo ""
+
+    # Stats
+    echo "## Project Stats"
+    _get "/stats" | _jq '.' 2>/dev/null || echo "(stats unavailable)"
+    echo ""
+
+    # In-progress work
+    echo "## In Progress"
+    local ip
+    ip=$(_get "/issues?status=in_progress&pageSize=50" 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+        echo "$ip" | _jq -r '.items[]? | "◐ " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title' 2>/dev/null || echo "(none)"
+    else
+        echo "(none)"
+    fi
+    echo ""
+
+    # Ready work (open, not blocked)
+    echo "## Ready to Work"
+    local open
+    open=$(_get "/issues?status=open&pageSize=50" 2>/dev/null)
+    if [[ -n "$open" ]]; then
+        echo "$open" | _jq -r '.items[]? | "○ " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title' 2>/dev/null || echo "(none)"
+    else
+        echo "(none)"
+    fi
+    echo ""
+
+    # Recent activity
+    echo "## Recent Activity"
+    _get "/events?pageSize=5" | _jq -r '.items[]? | .createdAt + " " + .actorId + " " + .action + " " + .issueId' 2>/dev/null || echo "(none)"
+    echo ""
+
+    echo "---"
+    echo "Commands: taskstackai ready | taskstackai create | taskstackai show <id> | taskstackai close <id>"
+    echo "Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred"
+}
+
+cmd_ready() {
+    local json_flag=false page=1 page_size=25
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)     json_flag=true; shift ;;
+            --page)     page="$2"; shift 2 ;;
+            --pageSize) page_size="$2"; shift 2 ;;
+            --help|-h)  echo "Usage: taskstackai ready [--json] [--page N] [--pageSize N]"; return 0 ;;
+            *)          shift ;;
+        esac
+    done
+
+    local result
+    result=$(_get "/issues?status=open&page=${page}&pageSize=${page_size}")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        local count
+        count=$(echo "$result" | _jq '.totalCount // 0')
+        echo "Ready to work ($count open issues):"
+        echo ""
+        echo "$result" | _jq -r '.items[]? | "○ " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title' 2>/dev/null
+        if [[ "$count" == "0" ]]; then
+            echo "  (no ready issues)"
+        fi
+    fi
+}
+
+cmd_create() {
+    local title="" description="" type="task" priority=2 assignee="" parent=""
+    local json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title|-t)       title="$2"; shift 2 ;;
+            --description|-d) description="$2"; shift 2 ;;
+            --type)           type="$2"; shift 2 ;;
+            --priority|-p)    priority="$2"; shift 2 ;;
+            --assignee)       assignee="$2"; shift 2 ;;
+            --parent)         parent="$2"; shift 2 ;;
+            --json)           json_flag=true; shift ;;
+            --help|-h)        echo "Usage: taskstackai create --title \"...\" [--type task] [--priority 2] [--description \"...\"] [--assignee id] [--parent id] [--json]"; return 0 ;;
+            *)
+                # Positional: first is title
+                if [[ -z "$title" ]]; then
+                    title="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$title" ]]; then
+        read -rp "Title: " title
+    fi
+
+    local body
+    body=$(_jq -n \
+        --arg title "$title" \
+        --arg desc "$description" \
+        --arg type "$type" \
+        --argjson priority "$priority" \
+        --arg assignee "$assignee" \
+        --arg parent "$parent" \
+        '{title: $title, type: $type, priority: $priority} +
+         (if $desc != "" then {description: $desc} else {} end) +
+         (if $assignee != "" then {assigneeId: $assignee} else {} end) +
+         (if $parent != "" then {parentId: $parent} else {} end)')
+
+    local result
+    result=$(_post "/issues" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        local id
+        id=$(echo "$result" | _jq -r '.id')
+        echo "✓ Created issue: $id — $title"
+        echo "  Priority: P${priority}"
+        echo "  Type: $type"
+        echo "  Status: open"
+    fi
+}
+
+cmd_show() {
+    local id="" json_flag=false long_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --long|-l) long_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai show <id> [--long] [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: Issue ID required" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/issues/$id")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return 0
+    fi
+
+    local title status type priority assignee desc created updated
+    title=$(echo "$result" | _jq -r '.title')
+    status=$(echo "$result" | _jq -r '.status')
+    type=$(echo "$result" | _jq -r '.type')
+    priority=$(echo "$result" | _jq -r '.priority')
+    assignee=$(echo "$result" | _jq -r '.assigneeId // "unassigned"')
+    desc=$(echo "$result" | _jq -r '.description // "(no description)"')
+    created=$(echo "$result" | _jq -r '.createdAt')
+    updated=$(echo "$result" | _jq -r '.updatedAt')
+
+    local icon
+    icon=$(_status_icon "$status")
+
+    echo "$icon $id · $title   [$(_priority_label "$priority") · ${status^^}]"
+    echo "Owner: $assignee · Type: $type"
+    echo "Created: $created · Updated: $updated"
+    echo ""
+    echo "DESCRIPTION"
+    echo "$desc"
+
+    # Dependencies
+    if $long_flag; then
+        echo ""
+        echo "BLOCKED BY"
+        _get "/deps/$id/blocked-by" | _jq -r '.[]? | "  → " + .dependsOnId + ": " + (.dependsOnTitle // "")' 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "BLOCKS"
+        _get "/deps/$id/blocks" | _jq -r '.[]? | "  ← " + .issueId + ": " + (.issueTitle // "")' 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "COMMENTS"
+        _get "/comments/$id" | _jq -r '.[]? | "  " + .authorName + " (" + .createdAt + "): " + .body' 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "EVENTS"
+        _get "/events/issue/$id" | _jq -r '.[]? | "  " + .createdAt + " " + .actorId + " " + .action' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_list() {
+    local status="" type="" priority="" assignee="" page=1 page_size=25
+    local json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)    status="$2"; shift 2 ;;
+            --type)      type="$2"; shift 2 ;;
+            --priority)  priority="$2"; shift 2 ;;
+            --assignee)  assignee="$2"; shift 2 ;;
+            --page)      page="$2"; shift 2 ;;
+            --pageSize)  page_size="$2"; shift 2 ;;
+            --json)      json_flag=true; shift ;;
+            --help|-h)   echo "Usage: taskstackai list [--status open] [--type task] [--priority 2] [--assignee id] [--page 1] [--pageSize 25] [--json]"; return 0 ;;
+            *)           shift ;;
+        esac
+    done
+
+    local qs="page=${page}&pageSize=${page_size}"
+    [[ -n "$status" ]]   && qs+="&status=$status"
+    [[ -n "$type" ]]     && qs+="&type=$type"
+    [[ -n "$priority" ]] && qs+="&priority=$priority"
+    [[ -n "$assignee" ]] && qs+="&assigneeId=$assignee"
+
+    local result
+    result=$(_get "/issues?${qs}")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        local total
+        total=$(echo "$result" | _jq '.totalCount // 0')
+        echo "$result" | _jq -r '.items[]? | (.status | if . == "open" then "○" elif . == "in_progress" then "◐" elif . == "closed" then "✓" elif . == "deferred" then "❄" else "●" end) + " " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title'
+        echo ""
+        echo "Total: $total issues"
+        echo "Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred"
+    fi
+}
+
+cmd_update() {
+    local id="" title="" description="" type="" priority="" assignee=""
+    local claim_flag=false json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)         title="$2"; shift 2 ;;
+            --description)   description="$2"; shift 2 ;;
+            --type)          type="$2"; shift 2 ;;
+            --priority|-p)   priority="$2"; shift 2 ;;
+            --assignee)      assignee="$2"; shift 2 ;;
+            --claim)         claim_flag=true; shift ;;
+            --json)          json_flag=true; shift ;;
+            --help|-h)       echo "Usage: taskstackai update <id> [--title ...] [--description ...] [--type ...] [--priority N] [--assignee id] [--claim] [--json]"; return 0 ;;
+            *)               [[ -z "$id" ]] && id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: Issue ID required" >&2; return 1
+    fi
+
+    if $claim_flag; then
+        cmd_claim "$id" $(${json_flag} && echo "--json")
+        return $?
+    fi
+
+    local body
+    body=$(_jq -n \
+        --arg title "$title" \
+        --arg desc "$description" \
+        --arg type "$type" \
+        --arg priority "$priority" \
+        --arg assignee "$assignee" \
+        '(if $title != "" then {title: $title} else {} end) +
+         (if $desc != "" then {description: $desc} else {} end) +
+         (if $type != "" then {type: $type} else {} end) +
+         (if $priority != "" then {priority: ($priority|tonumber)} else {} end) +
+         (if $assignee != "" then {assigneeId: $assignee} else {} end)')
+
+    local result
+    result=$(_patch "/issues/$id" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Updated issue: $id"
+    fi
+}
+
+cmd_close() {
+    local reason="" json_flag=false
+    local -a ids=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --reason)  reason="$2"; shift 2 ;;
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai close <id> [<id2> ...] [--reason \"...\"] [--json]"; return 0 ;;
+            *)         ids+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ ${#ids[@]} -eq 0 ]]; then
+        echo "Error: At least one issue ID required" >&2; return 1
+    fi
+
+    for id in "${ids[@]}"; do
+        local body
+        body=$(_jq -n --arg reason "$reason" \
+            'if $reason != "" then {reason: $reason} else {} end')
+
+        local result
+        result=$(_post "/issues/$id/close" -d "$body")
+
+        if $json_flag; then
+            echo "$result" | _jq '.'
+        else
+            echo "✓ Closed $id"
+        fi
+    done
+}
+
+cmd_reopen() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai reopen <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: Issue ID required" >&2; return 1
+    fi
+
+    local result
+    result=$(_post "/issues/$id/reopen")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Reopened $id"
+    fi
+}
+
+cmd_claim() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai claim <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Error: Issue ID required" >&2; return 1
+    fi
+
+    # Auto-detect git branch
+    local branch=""
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+
+    local result
+    if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+        result=$(_post "/issues/$id/claim" -d "{\"branchName\":\"$branch\"}")
+    else
+        result=$(_post "/issues/$id/claim" -d "{}")
+    fi
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Claimed $id (status: in_progress)"
+        if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+            echo "  Branch: $branch"
+        fi
+    fi
+}
+
+cmd_search() {
+    local query="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai search <query> [--json]"; return 0 ;;
+            *)         query="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$query" ]]; then
+        echo "Error: Search query required" >&2; return 1
+    fi
+
+    local encoded
+    encoded=$(printf '%s' "$query" | _jq -sRr @uri 2>/dev/null || echo "$query")
+
+    local result
+    result=$(_get "/search?q=${encoded}")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "$result" | _jq -r '.[]? | .id + " " + .title + (if .snippet then "\n  " + .snippet else "" end)' 2>/dev/null
+    fi
+}
+
+cmd_stats() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/stats")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "📊 Project Stats"
+        echo ""
+        echo "$result" | _jq -r 'to_entries[]? | "  " + .key + ": " + (.value|tostring)' 2>/dev/null
+    fi
+}
+
+cmd_blocked() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    # Get all open issues, then check which have unresolved blockers
+    local result
+    result=$(_get "/issues?status=open&pageSize=100")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Blocked Issues:"
+        echo ""
+        # For each open issue, check if it has unresolved blockers
+        echo "$result" | _jq -r '.items[]? | "● " + .id + " ● P" + (.priority|tostring) + " [" + .type + "] " + .title' 2>/dev/null
+        echo ""
+        echo "(Note: use 'taskstackai show <id> --long' to see blocking dependencies)"
+    fi
+}
+
+# ── Dependency commands ──────────────────────────────────────────────────────
+
+cmd_dep() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        add)       cmd_dep_add "$@" ;;
+        rm|remove) cmd_dep_rm "$@" ;;
+        blocks)    cmd_dep_blocks "$@" ;;
+        blocked-by) cmd_dep_blocked_by "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai dep <add|rm|blocks|blocked-by> ..."
+            echo ""
+            echo "  taskstackai dep add <issue> <depends-on>   Add dependency"
+            echo "  taskstackai dep rm <issue> <depends-on>     Remove dependency"
+            echo "  taskstackai dep blocks <id>                 What this issue blocks"
+            echo "  taskstackai dep blocked-by <id>             What blocks this issue"
+            ;;
+        *) echo "Unknown dep subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_dep_add() {
+    local issue_id="${1:-}" depends_on="${2:-}" json_flag=false
+    [[ "${3:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$issue_id" || -z "$depends_on" ]]; then
+        echo "Usage: taskstackai dep add <issue-id> <depends-on-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg i "$issue_id" --arg d "$depends_on" \
+        '{issueId: $i, dependsOnId: $d}')
+
+    local result
+    result=$(_post "/deps" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Added dependency: $issue_id depends on $depends_on"
+    fi
+}
+
+cmd_dep_rm() {
+    local issue_id="${1:-}" depends_on="${2:-}"
+
+    if [[ -z "$issue_id" || -z "$depends_on" ]]; then
+        echo "Usage: taskstackai dep rm <issue-id> <depends-on-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg i "$issue_id" --arg d "$depends_on" \
+        '{issueId: $i, dependsOnId: $d}')
+
+    _delete "/deps" -d "$body"
+    echo "✓ Removed dependency: $issue_id no longer depends on $depends_on"
+}
+
+cmd_dep_blocks() {
+    local id="${1:-}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai dep blocks <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/deps/$id/blocks")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Issues blocked by $id:"
+        echo "$result" | _jq -r '.[]? | "  ← " + .issueId' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_dep_blocked_by() {
+    local id="${1:-}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai dep blocked-by <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/deps/$id/blocked-by")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Issues blocking $id:"
+        echo "$result" | _jq -r '.[]? | "  → " + .dependsOnId' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+# ── Epic commands ────────────────────────────────────────────────────────────
+
+cmd_epic() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)    cmd_epic_list "$@" ;;
+        tree)    cmd_epic_tree "$@" ;;
+        subtask) cmd_epic_subtask "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai epic <list|tree|subtask> ..."
+            echo ""
+            echo "  taskstackai epic list              List all epics"
+            echo "  taskstackai epic tree <id>         Show epic tree"
+            echo "  taskstackai epic subtask <id>      Create subtask under epic"
+            ;;
+        *) echo "Unknown epic subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_epic_list() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/epics")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Epics:"
+        echo ""
+        echo "$result" | _jq -r '.[]? | (.status | if . == "open" then "○" elif . == "in_progress" then "◐" elif . == "closed" then "✓" else "?" end) + " " + .id + " " + .title + " (" + (.completionPercent|tostring) + "% complete, " + (.childCount|tostring) + " children)"' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_epic_tree() {
+    local id="${1:-}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai epic tree <epic-id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/epics/$id/tree")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "$result" | _jq -r '
+            def render(indent):
+                (indent + (.status | if . == "open" then "○" elif . == "in_progress" then "◐" elif . == "closed" then "✓" else "?" end) + " " + .id + " " + .title),
+                (.children[]? | render(indent + "  "));
+            render("")
+        ' 2>/dev/null
+    fi
+}
+
+cmd_epic_subtask() {
+    local parent_id="${1:-}" title="${2:-}" json_flag=false
+    [[ "${3:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$parent_id" || -z "$title" ]]; then
+        echo "Usage: taskstackai epic subtask <parent-id> \"<title>\"" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg title "$title" '{title: $title}')
+
+    local result
+    result=$(_post "/epics/$parent_id/subtasks" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        local id
+        id=$(echo "$result" | _jq -r '.id')
+        echo "✓ Created subtask: $id — $title (parent: $parent_id)"
+    fi
+}
+
+# ── Label commands ───────────────────────────────────────────────────────────
+
+cmd_label() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)    cmd_label_list "$@" ;;
+        create)  cmd_label_create "$@" ;;
+        add)     cmd_label_add "$@" ;;
+        rm|remove) cmd_label_rm "$@" ;;
+        delete)  cmd_label_delete "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai label <list|create|add|rm|delete> ..."
+            echo ""
+            echo "  taskstackai label list                   List all labels"
+            echo "  taskstackai label create <name> [color]   Create label"
+            echo "  taskstackai label add <issue> <label-id>  Assign label to issue"
+            echo "  taskstackai label rm <issue> <label-id>   Remove label from issue"
+            echo "  taskstackai label delete <label-id>        Delete label"
+            ;;
+        *) echo "Unknown label subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_label_list() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/labels")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Labels:"
+        echo "$result" | _jq -r '.[]? | "  [" + (.id|tostring) + "] " + .name + " (" + .color + ")"' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_label_create() {
+    local name="${1:-}" color="${2:-#6ea8fe}" json_flag=false
+    [[ "${3:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$name" ]]; then
+        echo "Usage: taskstackai label create <name> [color]" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg name "$name" --arg color "$color" \
+        '{name: $name, color: $color}')
+
+    local result
+    result=$(_post "/labels" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Created label: $name ($color)"
+    fi
+}
+
+cmd_label_add() {
+    local issue_id="${1:-}" label_id="${2:-}"
+
+    if [[ -z "$issue_id" || -z "$label_id" ]]; then
+        echo "Usage: taskstackai label add <issue-id> <label-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg i "$issue_id" --argjson l "$label_id" \
+        '{issueId: $i, labelId: $l}')
+
+    _post "/labels/assign" -d "$body" >/dev/null
+    echo "✓ Added label $label_id to issue $issue_id"
+}
+
+cmd_label_rm() {
+    local issue_id="${1:-}" label_id="${2:-}"
+
+    if [[ -z "$issue_id" || -z "$label_id" ]]; then
+        echo "Usage: taskstackai label rm <issue-id> <label-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg i "$issue_id" --argjson l "$label_id" \
+        '{issueId: $i, labelId: $l}')
+
+    _delete "/labels/assign" -d "$body" >/dev/null
+    echo "✓ Removed label $label_id from issue $issue_id"
+}
+
+cmd_label_delete() {
+    local label_id="${1:-}"
+
+    if [[ -z "$label_id" ]]; then
+        echo "Usage: taskstackai label delete <label-id>" >&2; return 1
+    fi
+
+    _delete "/labels/$label_id" >/dev/null
+    echo "✓ Deleted label $label_id"
+}
+
+# ── Comment commands ─────────────────────────────────────────────────────────
+
+cmd_comment() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        add)     cmd_comment_add "$@" ;;
+        list)    cmd_comment_list "$@" ;;
+        edit)    cmd_comment_edit "$@" ;;
+        delete)  cmd_comment_delete "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai comment <add|list|edit|delete> ..."
+            echo ""
+            echo "  taskstackai comment add <issue-id> \"text\"   Add comment"
+            echo "  taskstackai comment list <issue-id>          List comments"
+            echo "  taskstackai comment edit <comment-id> \"text\" Edit comment"
+            echo "  taskstackai comment delete <comment-id>       Delete comment"
+            ;;
+        *) echo "Unknown comment subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_comment_add() {
+    local issue_id="${1:-}" body_text="${2:-}" json_flag=false
+    [[ "${3:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$issue_id" || -z "$body_text" ]]; then
+        echo "Usage: taskstackai comment add <issue-id> \"comment text\"" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg i "$issue_id" --arg b "$body_text" \
+        '{issueId: $i, body: $b}')
+
+    local result
+    result=$(_post "/comments" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "✓ Comment added to $issue_id"
+    fi
+}
+
+cmd_comment_list() {
+    local issue_id="${1:-}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$issue_id" ]]; then
+        echo "Usage: taskstackai comment list <issue-id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/comments/$issue_id")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Comments for $issue_id:"
+        echo ""
+        echo "$result" | _jq -r '.[]? | "  " + .authorName + " (" + .createdAt + "):\n    " + .body + "\n"' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_comment_edit() {
+    local comment_id="${1:-}" body_text="${2:-}"
+
+    if [[ -z "$comment_id" || -z "$body_text" ]]; then
+        echo "Usage: taskstackai comment edit <comment-id> \"new text\"" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg b "$body_text" '{body: $b}')
+
+    _patch "/comments/$comment_id" -d "$body" >/dev/null
+    echo "✓ Comment $comment_id updated"
+}
+
+cmd_comment_delete() {
+    local comment_id="${1:-}"
+
+    if [[ -z "$comment_id" ]]; then
+        echo "Usage: taskstackai comment delete <comment-id>" >&2; return 1
+    fi
+
+    _delete "/comments/$comment_id" >/dev/null
+    echo "✓ Comment $comment_id deleted"
+}
+
+# ── Event commands ───────────────────────────────────────────────────────────
+
+cmd_event() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)    cmd_event_list "$@" ;;
+        issue)   cmd_event_issue "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai event <list|issue> ..."
+            echo ""
+            echo "  taskstackai event list [--page N]      Org-wide event feed"
+            echo "  taskstackai event issue <issue-id>     Events for a specific issue"
+            ;;
+        *) echo "Unknown event subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_event_list() {
+    local page=1 json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --page) page="$2"; shift 2 ;;
+            --json) json_flag=true; shift ;;
+            *)      shift ;;
+        esac
+    done
+
+    local result
+    result=$(_get "/events?page=${page}&pageSize=25")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Recent Activity:"
+        echo ""
+        echo "$result" | _jq -r '.items[]? | "  " + .createdAt + " " + .actorId + " " + .action + " " + .issueId + (if .newValue then " → " + .newValue else "" end)' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_event_issue() {
+    local id="${1:-}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai event issue <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/events/issue/$id")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Events for $id:"
+        echo ""
+        echo "$result" | _jq -r '.[]? | "  " + .createdAt + " " + .actorId + " " + .action + (if .oldValue then " (" + .oldValue + " → " + .newValue + ")" else "" end)' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+# ── Dashboard commands ───────────────────────────────────────────────────────
+
+cmd_dashboard() {
+    local subcmd="${1:-stats}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        stats)    cmd_dashboard_stats "$@" ;;
+        burndown) cmd_dashboard_burndown "$@" ;;
+        velocity) cmd_dashboard_velocity "$@" ;;
+        activity) cmd_dashboard_activity "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai dashboard <stats|burndown|velocity|activity>"
+            ;;
+        *) echo "Unknown dashboard subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_dashboard_stats() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/dashboard")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "📊 Dashboard"
+        echo "$result" | _jq -r 'to_entries[]? | "  " + .key + ": " + (.value|tostring)' 2>/dev/null
+    fi
+}
+
+cmd_dashboard_burndown() {
+    local days="${1:-30}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    _get "/dashboard/burndown?days=${days}" | _jq '.' 2>/dev/null
+}
+
+cmd_dashboard_velocity() {
+    local weeks="${1:-8}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    _get "/dashboard/velocity?weeks=${weeks}" | _jq '.' 2>/dev/null
+}
+
+cmd_dashboard_activity() {
+    local count="${1:-10}" json_flag=false
+    [[ "${2:-}" == "--json" ]] && json_flag=true
+
+    _get "/dashboard/activity?count=${count}" | _jq '.' 2>/dev/null
+}
+
+# ── Export / Import ──────────────────────────────────────────────────────────
+
+cmd_export() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    echo "Exporting all issues..."
+    local page=1 total=0
+    local all_items="[]"
+
+    while true; do
+        local result
+        result=$(_get "/issues?page=${page}&pageSize=100")
+        local items count
+        items=$(echo "$result" | _jq '.items')
+        count=$(echo "$items" | _jq 'length')
+        total=$(echo "$result" | _jq '.totalCount')
+
+        if [[ "$count" == "0" ]]; then
+            break
+        fi
+
+        all_items=$(echo "$all_items $items" | _jq -s '.[0] + .[1]')
+        page=$((page + 1))
+    done
+
+    if $json_flag; then
+        echo "$all_items" | _jq '.'
+    else
+        local bss_dir
+        bss_dir=$(_config_dir)
+        local export_file="$bss_dir/export-$(date +%Y%m%d-%H%M%S).json"
+        echo "$all_items" | _jq '.' > "$export_file"
+        echo "✓ Exported $total issues to $export_file"
+    fi
+}
+
+cmd_import() {
+    local file="${1:-}"
+
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        echo "Usage: taskstackai import <file.json>" >&2; return 1
+    fi
+
+    local count
+    count=$(_jq 'length' < "$file")
+    echo "Importing $count issues from $file..."
+
+    _jq -c '.[]' < "$file" | while read -r issue; do
+        local title type priority desc
+        title=$(echo "$issue" | _jq -r '.title')
+        type=$(echo "$issue" | _jq -r '.type // "task"')
+        priority=$(echo "$issue" | _jq -r '.priority // 2')
+        desc=$(echo "$issue" | _jq -r '.description // ""')
+
+        local body
+        body=$(_jq -n \
+            --arg t "$title" --arg d "$desc" --arg ty "$type" --argjson p "$priority" \
+            '{title: $t, description: $d, type: $ty, priority: $p}')
+
+        _post "/issues" -d "$body" >/dev/null 2>&1
+        echo "  ✓ $title"
+    done
+    echo "✓ Import complete"
+}
+
+# ── Project member commands ───────────────────────────────────────────────────
+
+cmd_project() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        members)  cmd_project_members "$@" ;;
+        invite)   cmd_project_invite "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai project <members|invite> ..."
+            echo ""
+            echo "  taskstackai project members [--project <id>]                          List project members"
+            echo "  taskstackai project invite <email> --display-name <name> [--role <role>] [--project <id>]  Invite member"
+            ;;
+        *) echo "Unknown project subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_project_members() {
+    local json_flag=false project_override=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)      json_flag=true; shift ;;
+            --project)   project_override="$2"; shift 2 ;;
+            --help|-h)   echo "Usage: taskstackai project members [--project <id>] [--json]"; return 0 ;;
+            *)           shift ;;
+        esac
+    done
+
+    local project_id
+    project_id=$(_resolve_project_id "$project_override") || return 1
+
+    local result
+    result=$(_get "/projects/${project_id}/members")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Project Members:"
+        echo ""
+        printf "  %-24s %-30s %-10s %s\n" "NAME" "EMAIL" "ROLE" "JOINED"
+        printf "  %-24s %-30s %-10s %s\n" "────────────────────────" "──────────────────────────────" "──────────" "──────────"
+        echo "$result" | _jq -r '.[]? | "  " + (.displayName | if length > 24 then .[:21] + "..." else . + (" " * (24 - length)) end) + " " + (.email | if length > 30 then .[:27] + "..." else . + (" " * (30 - length)) end) + " " + (.role | . + (" " * (10 - length))) + " " + (.joinedAt | split("T")[0])' 2>/dev/null
+        local count
+        count=$(echo "$result" | _jq 'length // 0')
+        echo ""
+        echo "Total: $count members"
+    fi
+}
+
+cmd_project_invite() {
+    local email="" display_name="" role="Member" project_override="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --display-name) display_name="$2"; shift 2 ;;
+            --role)         role="$2"; shift 2 ;;
+            --project)      project_override="$2"; shift 2 ;;
+            --json)         json_flag=true; shift ;;
+            --help|-h)      echo "Usage: taskstackai project invite <email> --display-name <name> [--role member|admin|viewer] [--project <id>] [--json]"; return 0 ;;
+            *)
+                if [[ -z "$email" ]]; then
+                    email="$1"
+                fi
+                shift ;;
+        esac
+    done
+
+    if [[ -z "$email" ]]; then
+        echo "Error: Email address required" >&2; return 1
+    fi
+    if [[ -z "$display_name" ]]; then
+        echo "Error: --display-name is required" >&2; return 1
+    fi
+
+    local project_id
+    project_id=$(_resolve_project_id "$project_override") || return 1
+
+    local body
+    body=$(_jq -n \
+        --arg email "$email" \
+        --arg displayName "$display_name" \
+        --arg role "$role" \
+        '{email: $email, displayName: $displayName, role: $role}')
+
+    local result
+    result=$(_post "/projects/${project_id}/members/invite" -d "$body")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        local name
+        name=$(echo "$result" | _jq -r '.displayName // "user"')
+        local assigned_role
+        assigned_role=$(echo "$result" | _jq -r '.role // "Member"')
+        echo "✓ Invited $email ($name) as $assigned_role"
+    fi
+}
+
+# ── Org management ───────────────────────────────────────────────────────────
+
+cmd_org() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        members)  cmd_org_members "$@" ;;
+        invite)   cmd_org_invite "$@" ;;
+        me)       cmd_org_me "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai org <members|invite|me>"
+            echo ""
+            echo "  taskstackai org me           Show current user info"
+            echo "  taskstackai org members      List org members"
+            echo "  taskstackai org invite <email>  Invite member"
+            ;;
+        *) echo "Unknown org subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_org_me() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/auth/me")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "$result" | _jq -r '"User: " + .displayName + " (" + .email + ")\nOrg: " + .organization.name + " (" + .organization.slug + ")\nPlan: " + .organization.plan' 2>/dev/null
+    fi
+}
+
+cmd_org_members() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/org/members")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "Team Members:"
+        echo "$result" | _jq -r '.[]? | "  " + .displayName + " (" + .email + ") — " + .role' 2>/dev/null
+    fi
+}
+
+cmd_org_invite() {
+    local email="${1:-}" role="${2:-Member}"
+
+    if [[ -z "$email" ]]; then
+        echo "Usage: taskstackai org invite <email> [role]" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg e "$email" --arg r "$role" '{email: $e, role: $r}')
+
+    _post "/org/invite" -d "$body" >/dev/null
+    echo "✓ Invited $email as $role"
+}
+
+# ── API Key management ───────────────────────────────────────────────────────
+
+cmd_apikey() {
+    local subcmd="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)    cmd_apikey_list "$@" ;;
+        create)  cmd_apikey_create "$@" ;;
+        delete)  cmd_apikey_delete "$@" ;;
+        --help|-h|help)
+            echo "Usage: taskstackai apikey <list|create|delete>"
+            echo ""
+            echo "  taskstackai apikey list                       List API keys"
+            echo "  taskstackai apikey create <label> [scopes]    Create new key"
+            echo "  taskstackai apikey delete <id>                 Delete key"
+            ;;
+        *) echo "Unknown apikey subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_apikey_list() {
+    local json_flag=false
+    [[ "${1:-}" == "--json" ]] && json_flag=true
+
+    local result
+    result=$(_get "/auth/api-keys")
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+    else
+        echo "API Keys:"
+        echo "$result" | _jq -r '.[]? | "  [" + .id + "] " + .label + " — scopes: " + .scopes + (if .expiresAt then " (expires: " + .expiresAt + ")" else "" end)' 2>/dev/null || echo "  (none)"
+    fi
+}
+
+cmd_apikey_create() {
+    local label="${1:-}" scopes="${2:-issues:read,issues:write}"
+
+    if [[ -z "$label" ]]; then
+        echo "Usage: taskstackai apikey create <label> [scopes]" >&2; return 1
+    fi
+
+    local body
+    body=$(_jq -n --arg l "$label" --arg s "$scopes" '{label: $l, scopes: $s}')
+
+    local result
+    result=$(_post "/auth/api-keys" -d "$body")
+
+    echo "✓ API Key created:"
+    echo "$result" | _jq -r '"  Key: " + .rawKey + "\n  ID: " + .id + "\n  ⚠  Save this key — it will not be shown again."' 2>/dev/null
+}
+
+cmd_apikey_delete() {
+    local id="${1:-}"
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai apikey delete <key-id>" >&2; return 1
+    fi
+
+    _delete "/auth/api-keys/$id" >/dev/null
+    echo "✓ Deleted API key $id"
+}
+
+# ── Molecule commands ─────────────────────────────────────────────────────────
+
+cmd_mol() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        list)      cmd_mol_list "$@" ;;
+        show)      cmd_mol_show "$@" ;;
+        pour)      cmd_mol_pour "$@" ;;
+        templates) cmd_mol_templates "$@" ;;
+        create)    cmd_mol_create "$@" ;;
+        delete)    cmd_mol_delete "$@" ;;
+        progress)  cmd_mol_progress "$@" ;;
+        wisp)      cmd_mol_wisp "$@" ;;
+        squash)    cmd_mol_squash "$@" ;;
+        burn)      cmd_mol_burn "$@" ;;
+        wisps)     cmd_mol_wisps "$@" ;;
+        distill)   cmd_mol_distill "$@" ;;
+        --help|-h|help)
+            cat <<'EOF'
+Usage: taskstackai mol <subcommand> [options]
+
+  list                   List molecules (workflows)
+  show <id>              Show molecule detail
+  create                 Create a new molecule
+  pour                   Instantiate a molecule from a template
+  templates              List available templates
+  progress <id>          Show molecule progress with wave breakdown
+  delete <id>            Delete a molecule
+  wisp <id>              Create ephemeral wisp from a molecule
+  squash <wisp-id>       Squash wisp back into source (merge progress)
+  burn <wisp-id>         Burn (delete) wisp without merging
+  wisps                  List active wisps
+  distill                Distill template from epic/molecule
+EOF
+            ;;
+        *) echo "Unknown mol subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_mol_list() {
+    local json_flag=false type="" phase="" status=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --type)    type="$2"; shift 2 ;;
+            --phase)   phase="$2"; shift 2 ;;
+            --status)  status="$2"; shift 2 ;;
+            --help|-h) echo "Usage: taskstackai mol list [--type <work|swarm|patrol>] [--phase <proto|mol|wisp>] [--status <open|completed>] [--json]"; return 0 ;;
+            *)         shift ;;
+        esac
+    done
+
+    local qs=""
+    [[ -n "$type" ]]   && qs="${qs}&type=$type"
+    [[ -n "$phase" ]]  && qs="${qs}&phase=$phase"
+    [[ -n "$status" ]] && qs="${qs}&status=$status"
+    qs="${qs#&}"
+
+    local path="/molecules"
+    [[ -n "$qs" ]] && path="${path}?${qs}"
+
+    local result
+    result=$(_get "$path") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        if .items then
+            (.items[] |
+                (if .status == "open" then "○"
+                 elif .status == "in_progress" then "◐"
+                 elif .status == "completed" then "✓"
+                 else "?" end) + " " +
+                .id + " [" + .moleculeType + "/" + .phase + "] " +
+                .title +
+                " (" + (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " steps)"
+            ),
+            "",
+            "Total: " + (.totalCount|tostring) + " molecules"
+        else
+            "No molecules found."
+        end'
+}
+
+cmd_mol_show() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai mol show <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol show <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/molecules/$id") || { echo "Molecule '$id' not found." >&2; return 1; }
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        "╔══════════════════════════════════════════════════════════════",
+        "║ Molecule: " + .title,
+        "╠══════════════════════════════════════════════════════════════",
+        "║ ID:       " + .id,
+        "║ Type:     " + .moleculeType,
+        "║ Phase:    " + .phase,
+        "║ Status:   " + .status,
+        "║ Progress: " + (.completedSteps|tostring) + "/" + (.totalSteps|tostring) +
+            " (" + (.completionPercent|tostring) + "%)",
+        (if .assigneeName then "║ Assignee: " + .assigneeName else empty end),
+        (if .epicIssueId then "║ Epic:     " + .epicIssueId else empty end),
+        "║ Created:  " + .createdAt,
+        "╠══ Steps ═════════════════════════════════════════════════════",
+        (.steps // [] | sort_by(.wave, .sortOrder)[] |
+            "║  W" + (.wave|tostring) + " " +
+            (if .issueStatus == "closed" then "✓"
+             elif .issueStatus == "in_progress" then "◐"
+             else "○" end) + " " +
+            .issueId + " " + .issueTitle +
+            (if (.dependsOnStepIds | length) > 0 then
+                " (deps: " + ([.dependsOnStepIds[] | tostring] | join(",")) + ")"
+            else "" end)
+        ),
+        "╚══════════════════════════════════════════════════════════════"'
+}
+
+cmd_mol_create() {
+    local title="" description="" mol_type="work"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)       title="$2"; shift 2 ;;
+            --description) description="$2"; shift 2 ;;
+            --type)        mol_type="$2"; shift 2 ;;
+            --help|-h)     echo "Usage: taskstackai mol create --title <title> [--description <desc>] [--type <work|swarm|patrol>]"; return 0 ;;
+            *)             shift ;;
+        esac
+    done
+
+    if [[ -z "$title" ]]; then
+        echo "Usage: taskstackai mol create --title <title>" >&2; return 1
+    fi
+
+    local body
+    body=$(printf '{"title":"%s","description":%s,"moleculeType":"%s"}' \
+        "$title" \
+        "$(if [[ -n "$description" ]]; then printf '"%s"' "$description"; else echo null; fi)" \
+        "$mol_type")
+
+    local result
+    result=$(_post "/molecules" -d "$body") || return 1
+    echo "$result" | _jq -r '"✓ Created molecule " + .id + " - " + .title'
+}
+
+cmd_mol_delete() {
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h) echo "Usage: taskstackai mol delete <id>"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol delete <id>" >&2; return 1
+    fi
+
+    _delete "/molecules/$id" >/dev/null || { echo "Failed to delete molecule." >&2; return 1; }
+    echo "✓ Deleted molecule $id"
+}
+
+cmd_mol_pour() {
+    local template_id="" project_id="" anchor_date="" json_flag=false
+    local -a vars=() roles=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --template)    template_id="$2"; shift 2 ;;
+            --project)     project_id="$2"; shift 2 ;;
+            --anchor-date) anchor_date="$2"; shift 2 ;;
+            --var)         vars+=("$2"); shift 2 ;;
+            --role)        roles+=("$2"); shift 2 ;;
+            --json)        json_flag=true; shift ;;
+            --help|-h)
+                cat <<'EOF'
+Usage: taskstackai mol pour --template <id> [options]
+
+Options:
+  --template <id>       Template to instantiate (required)
+  --project <id>        Target project (default: active)
+  --anchor-date <date>  Anchor date for due date offsets (ISO 8601)
+  --var <key=value>     Variable substitution (repeatable)
+  --role <role=userId>  Role assignment (repeatable)
+  --json                Output raw JSON
+EOF
+                return 0
+                ;;
+            *)             shift ;;
+        esac
+    done
+
+    if [[ -z "$template_id" ]]; then
+        echo "Usage: taskstackai mol pour --template <id>" >&2; return 1
+    fi
+
+    # Build JSON body
+    local vars_json="{}"
+    for v in "${vars[@]}"; do
+        local key="${v%%=*}" val="${v#*=}"
+        vars_json=$(echo "$vars_json" | _jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+    done
+
+    local roles_json="{}"
+    for r in "${roles[@]}"; do
+        local key="${r%%=*}" val="${r#*=}"
+        roles_json=$(echo "$roles_json" | _jq --arg k "$key" --arg v "$val" '. + {($k): $v}')
+    done
+
+    local body
+    body=$(_jq -n \
+        --arg tid "$template_id" \
+        --arg pid "$project_id" \
+        --arg ad "$anchor_date" \
+        --argjson vars "$vars_json" \
+        --argjson roles "$roles_json" \
+        '{templateId: $tid, variables: $vars, roleAssignments: $roles} +
+         (if $pid != "" then {projectId: $pid} else {} end) +
+         (if $ad != "" then {anchorDate: $ad} else {} end)')
+
+    local result
+    result=$(_post "/molecules/pour" -d "$body") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Poured molecule " + .id + " - " + .title + " (" + (.totalSteps|tostring) + " steps)"'
+}
+
+cmd_mol_templates() {
+    local json_flag=false type=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --type)    type="$2"; shift 2 ;;
+            --help|-h) echo "Usage: taskstackai mol templates [--type <work|swarm|patrol>] [--json]"; return 0 ;;
+            *)         shift ;;
+        esac
+    done
+
+    local path="/molecule-templates"
+    [[ -n "$type" ]] && path="${path}?type=$type"
+
+    local result
+    result=$(_get "$path") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        if .items then
+            (.items[] |
+                .id + " [" + .moleculeType + "] " + .name + " - " + .title +
+                " (" + (.stepCount|tostring) + " steps)" +
+                (if .isBuiltIn then " ★" else "" end)
+            ),
+            "",
+            "Total: " + (.totalCount|tostring) + " templates"
+        else
+            "No templates found."
+        end'
+}
+
+cmd_mol_progress() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai mol progress <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol progress <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/molecules/$id/progress") || { echo "Molecule '$id' not found." >&2; return 1; }
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        "Progress for molecule " + .moleculeId,
+        "  Total:      " + (.totalSteps|tostring) + " steps",
+        "  Completed:  " + (.completedSteps|tostring),
+        "  In Progress:" + (.inProgressSteps|tostring),
+        "  Blocked:    " + (.blockedSteps|tostring),
+        "  Completion: " + (.completionPercent|tostring) + "%",
+        (if .stepsPerHour then "  Velocity:   " + (.stepsPerHour|tostring) + " steps/hour" else empty end),
+        (if .estimatedCompletion then "  ETA:        " + .estimatedCompletion else empty end),
+        "",
+        "Waves:",
+        (.waves // [] | .[] |
+            "  Wave " + (.waveNumber|tostring) + ": " +
+            (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " completed"
+        )'
+}
+
+cmd_mol_distill() {
+    local source_id="" source_type="epic" name="" description="" json_flag=false
+    local -a vars=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --source)      source_id="$2"; shift 2 ;;
+            --source-type) source_type="$2"; shift 2 ;;
+            --name)        name="$2"; shift 2 ;;
+            --description) description="$2"; shift 2 ;;
+            --var)         vars+=("$2"); shift 2 ;;
+            --json)        json_flag=true; shift ;;
+            --help|-h)
+                cat <<'EOF'
+Usage: taskstackai mol distill --source <id> --name <name> [options]
+
+Options:
+  --source <id>          Source epic or molecule ID (required)
+  --source-type <type>   "epic" or "molecule" (default: epic)
+  --name <name>          Template name (required)
+  --description <desc>   Template description
+  --var <find=varName>   Variable substitution (repeatable)
+  --json                 Output raw JSON
+EOF
+                return 0
+                ;;
+            *)             shift ;;
+        esac
+    done
+
+    if [[ -z "$source_id" || -z "$name" ]]; then
+        echo "Usage: taskstackai mol distill --source <id> --name <name>" >&2; return 1
+    fi
+
+    # Build variables array
+    local vars_json="[]"
+    for v in "${vars[@]}"; do
+        local find="${v%%=*}" var_name="${v#*=}"
+        vars_json=$(echo "$vars_json" | _jq --arg f "$find" --arg v "$var_name" '. + [{"find": $f, "varName": $v}]')
+    done
+
+    local body
+    body=$(_jq -n \
+        --arg sid "$source_id" \
+        --arg st "$source_type" \
+        --arg nm "$name" \
+        --arg desc "$description" \
+        --argjson vars "$vars_json" \
+        '{sourceId: $sid, sourceType: $st, name: $nm, variables: $vars} +
+         (if $desc != "" then {description: $desc} else {} end)')
+
+    local result
+    result=$(_post "/distill" -d "$body") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Distilled template " + .id + " - " + .name + " (" + (.stepCount|tostring) + " steps, " + ((.variables // []) | length | tostring) + " variables)"'
+}
+
+cmd_mol_wisp() {
+    local id="" ttl="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ttl)     ttl="$2"; shift 2 ;;
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai mol wisp <molecule-id> [--ttl <hours>] [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol wisp <molecule-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(printf '{"sourceMoleculeId":"%s"%s}' "$id" \
+        "$(if [[ -n "$ttl" ]]; then printf ',"ttlHours":%s' "$ttl"; fi)")
+
+    local result
+    result=$(_post "/wisps" -d "$body") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Created wisp " + .id + " from " + (.sourceMoleculeId // "unknown") + " (" + (.totalSteps|tostring) + " steps)"'
+}
+
+cmd_mol_squash() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai mol squash <wisp-id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol squash <wisp-id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_post "/wisps/$id/squash") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Squashed wisp into " + .id + " - " + .title + " (" + (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " steps)"'
+}
+
+cmd_mol_burn() {
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h) echo "Usage: taskstackai mol burn <wisp-id>"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai mol burn <wisp-id>" >&2; return 1
+    fi
+
+    _delete "/wisps/$id/burn" >/dev/null || { echo "Failed to burn wisp." >&2; return 1; }
+    echo "✓ Burned wisp $id"
+}
+
+cmd_mol_wisps() {
+    local json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai mol wisps [--json]"; return 0 ;;
+            *)         shift ;;
+        esac
+    done
+
+    local result
+    result=$(_get "/wisps") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "Active wisps:"
+    echo "$result" | _jq -r '.[] |
+        "  " + .id + " [" + .moleculeType + "] " + .title +
+        " (" + (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " steps)" +
+        (if .sourceMoleculeId then " ← " + .sourceMoleculeId else "" end)'
+}
+
+# ── Swarm commands ────────────────────────────────────────────────────────────
+
+cmd_swarm() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        create)      cmd_swarm_create "$@" ;;
+        status)      cmd_swarm_status "$@" ;;
+        ready)       cmd_swarm_ready "$@" ;;
+        validate)    cmd_swarm_validate "$@" ;;
+        list)        cmd_swarm_list "$@" ;;
+        --help|-h|help)
+            cat <<'EOF'
+Usage: taskstackai swarm <subcommand> [options]
+
+  create <epic-id>       Create a swarm from an epic
+  status <id>            Show swarm status with wave breakdown
+  ready <id>             Show ready front (unblocked steps)
+  validate <epic-id>     Validate an epic for swarming
+  list                   List active swarms
+EOF
+            ;;
+        *) echo "Unknown swarm subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_swarm_create() {
+    local epic_id="" coordinator="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --coordinator) coordinator="$2"; shift 2 ;;
+            --json)        json_flag=true; shift ;;
+            --help|-h)     echo "Usage: taskstackai swarm create <epic-id> [--coordinator <user-id>] [--json]"; return 0 ;;
+            *)             epic_id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$epic_id" ]]; then
+        echo "Usage: taskstackai swarm create <epic-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(printf '{"epicIssueId":"%s"%s}' \
+        "$epic_id" \
+        "$(if [[ -n "$coordinator" ]]; then printf ',"coordinatorId":"%s"' "$coordinator"; fi)")
+
+    local result
+    result=$(_post "/swarm/create" -d "$body") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Created swarm " + .id + " - " + .title + " (" + (.totalSteps|tostring) + " steps)"'
+}
+
+cmd_swarm_status() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai swarm status <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai swarm status <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/swarm/$id/status") || { echo "Swarm '$id' not found." >&2; return 1; }
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        "╔══════════════════════════════════════════════════════════════",
+        "║ Swarm Status: " + .moleculeId,
+        "╠══════════════════════════════════════════════════════════════",
+        "║ Total:         " + (.totalSteps|tostring) + " steps",
+        "║ Completed:     " + (.completedSteps|tostring),
+        "║ In Progress:   " + (.inProgressSteps|tostring),
+        "║ Max Parallel:  " + (.maxParallelism|tostring),
+        (if .velocity then "║ Velocity:      " + (.velocity|tostring) + " steps/hour" else empty end),
+        (if .estimatedCompletion then "║ ETA:           " + .estimatedCompletion else empty end),
+        "╠══ Waves ═════════════════════════════════════════════════════",
+        (.waves // [] | .[] |
+            "║  Wave " + (.waveNumber|tostring) + ": " +
+            (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " completed, " +
+            (.inProgressSteps|tostring) + " in progress"
+        ),
+        "╠══ Ready Front ═══════════════════════════════════════════════",
+        (if (.readyFront | length) > 0 then
+            (.readyFront[] |
+                "║  " + (if .issueStatus == "in_progress" then "◐" else "○" end) +
+                " " + .issueId + " " + .issueTitle +
+                " (W" + (.wave|tostring) + ")"
+            )
+        else
+            "║  No steps ready."
+        end),
+        "╚══════════════════════════════════════════════════════════════"'
+}
+
+cmd_swarm_ready() {
+    local id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai swarm ready <id> [--json]"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai swarm ready <id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/swarm/$id/ready-fronts") || { echo "Swarm '$id' not found." >&2; return 1; }
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "Ready front for swarm $id:"
+    echo "$result" | _jq -r '.[] |
+        "  " + (if .issueStatus == "in_progress" then "◐" else "○" end) +
+        " " + .issueId + " [W" + (.wave|tostring) + "] " + .issueTitle'
+}
+
+cmd_swarm_validate() {
+    local epic_id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai swarm validate <epic-id> [--json]"; return 0 ;;
+            *)         epic_id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$epic_id" ]]; then
+        echo "Usage: taskstackai swarm validate <epic-id>" >&2; return 1
+    fi
+
+    local result
+    result=$(_get "/swarm/$epic_id/validate") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '
+        (if .isValid then "✓ Epic is valid for swarming" else "✗ Epic has issues:" end),
+        (.errors // [] | .[] | "  ERROR: " + .),
+        (.warnings // [] | .[] | "  WARN:  " + .)'
+}
+
+cmd_swarm_list() {
+    local json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai swarm list [--json]"; return 0 ;;
+            *)         shift ;;
+        esac
+    done
+
+    local result
+    result=$(_get "/swarm/list") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "Active swarms:"
+    echo "$result" | _jq -r '.[] |
+        "  " + (if .status == "open" then "○" elif .status == "in_progress" then "◐" else "?" end) +
+        " " + .id + " [" + .phase + "] " + .title +
+        " (" + (.completedSteps|tostring) + "/" + (.totalSteps|tostring) + " steps)"'
+}
+
+# ── Bond commands ─────────────────────────────────────────────────────────────
+
+cmd_bond() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$subcmd" in
+        create)  cmd_bond_create "$@" ;;
+        list)    cmd_bond_list "$@" ;;
+        delete)  cmd_bond_delete "$@" ;;
+        --help|-h|help)
+            cat <<'EOF'
+Usage: taskstackai bond <subcommand> [options]
+
+  create     Create a bond between two molecules
+  list       List bonds (optionally for a specific molecule)
+  delete     Delete a bond
+EOF
+            ;;
+        *) echo "Unknown bond subcommand: $subcmd" >&2; return 1 ;;
+    esac
+}
+
+cmd_bond_create() {
+    local source="" target="" bond_type="sequential" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --source)  source="$2"; shift 2 ;;
+            --target)  target="$2"; shift 2 ;;
+            --type)    bond_type="$2"; shift 2 ;;
+            --json)    json_flag=true; shift ;;
+            --help|-h) echo "Usage: taskstackai bond create --source <id> --target <id> [--type <sequential|parallel|conditional>] [--json]"; return 0 ;;
+            *)         shift ;;
+        esac
+    done
+
+    if [[ -z "$source" || -z "$target" ]]; then
+        echo "Usage: taskstackai bond create --source <mol-id> --target <mol-id>" >&2; return 1
+    fi
+
+    local body
+    body=$(printf '{"sourceId":"%s","targetId":"%s","bondType":"%s"}' "$source" "$target" "$bond_type")
+
+    local result
+    result=$(_post "/bonds" -d "$body") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "$result" | _jq -r '"✓ Created bond #" + (.id|tostring) + ": " + .sourceMoleculeTitle + " → " + .targetMoleculeTitle + " [" + .bondType + "]"'
+}
+
+cmd_bond_list() {
+    local molecule_id="" json_flag=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --molecule) molecule_id="$2"; shift 2 ;;
+            --json)     json_flag=true; shift ;;
+            --help|-h)  echo "Usage: taskstackai bond list [--molecule <id>] [--json]"; return 0 ;;
+            *)          shift ;;
+        esac
+    done
+
+    local path="/bonds"
+    [[ -n "$molecule_id" ]] && path="${path}?moleculeId=$molecule_id"
+
+    local result
+    result=$(_get "$path") || return 1
+
+    if $json_flag; then
+        echo "$result" | _jq '.'
+        return
+    fi
+
+    echo "Bonds:"
+    echo "$result" | _jq -r '.[] |
+        "  #" + (.id|tostring) + " " + .sourceMoleculeTitle + " → " + .targetMoleculeTitle + " [" + .bondType + "]"'
+}
+
+cmd_bond_delete() {
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h) echo "Usage: taskstackai bond delete <bond-id>"; return 0 ;;
+            *)         id="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        echo "Usage: taskstackai bond delete <bond-id>" >&2; return 1
+    fi
+
+    _delete "/bonds/$id" >/dev/null || { echo "Failed to delete bond." >&2; return 1; }
+    echo "✓ Deleted bond #$id"
+}
+
+# ── Version ──────────────────────────────────────────────────────────────────
+
+cmd_ie() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+        export)  cmd_ie_export "$@" ;;
+        import)  cmd_ie_import "$@" ;;
+        preview) cmd_ie_preview "$@" ;;
+        help|--help|-h)
+            echo "Usage: taskstackai ie <subcommand>"
+            echo ""
+            echo "Subcommands:"
+            echo "  export [--status open] [-o file.jsonl]   Export issues as JSONL"
+            echo "  import <file> --format <fmt>             Import issues from file"
+            echo "  preview <file> --format <fmt>            Preview import file"
+            echo ""
+            echo "Formats: taskstackai, github_csv, jira_csv, linear_csv"
+            ;;
+        *)
+            echo "Unknown ie subcommand: $subcmd" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_ie_export() {
+    local status="" output=""
+    local comments="true" labels="true" deps="true"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)  status="$2"; shift 2 ;;
+            -o|--output) output="$2"; shift 2 ;;
+            --no-comments) comments="false"; shift ;;
+            --no-labels)   labels="false"; shift ;;
+            --no-deps)     deps="false"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local body
+    body=$(printf '{"format":"jsonl","includeComments":%s,"includeLabels":%s,"includeDependencies":%s' "$comments" "$labels" "$deps")
+    if [[ -n "$status" ]]; then
+        body="$body,\"status\":\"$status\""
+    fi
+    body="$body}"
+
+    if [[ -n "$output" ]]; then
+        _post "/import-export/export" -d "$body" > "$output"
+        echo "Exported to $output"
+    else
+        _post "/import-export/export" -d "$body"
+    fi
+}
+
+cmd_ie_import() {
+    local file="${1:-}"
+    shift 2>/dev/null || true
+    local format="taskstackai" dry_run="false"
+    local project_id="${TASKSTACKAI_PROJECT_ID:-}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format)    format="$2"; shift 2 ;;
+            --project)   project_id="$2"; shift 2 ;;
+            --dry-run)   dry_run="true"; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        echo "Usage: taskstackai ie import <file> --format <fmt> [--dry-run]" >&2
+        return 1
+    fi
+
+    if [[ -z "$project_id" ]]; then
+        echo "Error: No project ID. Set TASKSTACKAI_PROJECT_ID or use --project <id>." >&2
+        return 1
+    fi
+
+    local url="${TASKSTACKAI_SERVER:-https://taskstackai.com}/api/v1/import-export/import"
+    local result
+    result=$(curl -s -S --fail-with-body \
+        -H "Authorization: Bearer ${TASKSTACKAI_API_KEY}" \
+        -F "file=@${file}" \
+        -F "format=${format}" \
+        -F "projectId=${project_id}" \
+        -F "dryRun=${dry_run}" \
+        "$url" 2>/dev/null) || {
+        echo "Error: Import API request failed" >&2
+        return 1
+    }
+
+    echo "$result" | _jq -r '"Import complete: \(.imported) imported, \(.skipped) skipped, \(.total) total" + if (.errors | length) > 0 then "\nErrors:" else "" end'
+    echo "$result" | _jq -r '.errors[]? | "  Row \(.row): \(.message)"'
+}
+
+cmd_ie_preview() {
+    local file="${1:-}"
+    shift 2>/dev/null || true
+    local format="taskstackai"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format) format="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        echo "Usage: taskstackai ie preview <file> --format <fmt>" >&2
+        return 1
+    fi
+
+    local url="${TASKSTACKAI_SERVER:-https://taskstackai.com}/api/v1/import-export/import/preview"
+    local result
+    result=$(curl -s -S --fail-with-body \
+        -H "Authorization: Bearer ${TASKSTACKAI_API_KEY}" \
+        -F "file=@${file}" \
+        -F "format=${format}" \
+        "$url" 2>/dev/null) || {
+        echo "Error: Preview API request failed" >&2
+        return 1
+    }
+
+    echo "$result" | _jq -r '"Total rows: \(.totalRows)\nColumns: \(.detectedColumns | join(", "))"'
+    echo ""
+    echo "$result" | _jq -r '.previewRows[]? | to_entries | map("\(.key): \(.value)") | join(" | ")'
+}
+
+cmd_dup() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+        check)  cmd_dup_check "$@" ;;
+        scan)   cmd_dup_scan "$@" ;;
+        mark)   cmd_dup_mark "$@" ;;
+        unmark) cmd_dup_unmark "$@" ;;
+        help|--help|-h)
+            echo "Usage: taskstackai dup <subcommand>"
+            echo ""
+            echo "Subcommands:"
+            echo "  check <title>              Check for duplicates by title text"
+            echo "  scan [--status open]       Scan backlog for potential duplicates"
+            echo "  mark <issue-id> <orig-id>  Mark issue as duplicate of another"
+            echo "  unmark <issue-id>          Remove duplicate marking"
+            ;;
+        *)
+            echo "Unknown dup subcommand: $subcmd" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_dup_check() {
+    local title="$*"
+    if [[ -z "$title" ]]; then
+        echo "Usage: taskstackai dup check <title text>" >&2
+        return 1
+    fi
+
+    local body
+    body=$(printf '{"title":"%s"}' "$(echo "$title" | sed 's/"/\\"/g')")
+
+    local result
+    result=$(_post "/issues/duplicates/check" -d "$body")
+
+    echo "$result" | _jq -r '
+        if (.items | length) == 0 then "No duplicates found."
+        else .items[] | "\(.score)%  \(.issueId)  [\(.status)]  \(.title)"
+        end'
+}
+
+cmd_dup_scan() {
+    local status="open"
+    local min_score="50"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status)  status="$2"; shift 2 ;;
+            --min-score) min_score="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local path="/duplicates/scan?status=${status}&minScore=${min_score}&pageSize=50"
+    local result
+    result=$(_get "$path")
+
+    echo "$result" | _jq -r '
+        if (.items | length) == 0 then "No potential duplicates found."
+        else .items[] |
+            "── \(.issue.id) [\(.issue.status)] \(.issue.title)" ,
+            (.candidates[] | "   └─ \(.score)%  \(.issueId) [\(.status)] \(.title)"),
+            ""
+        end'
+}
+
+cmd_dup_mark() {
+    local issue_id="${1:-}"
+    local canonical_id="${2:-}"
+
+    if [[ -z "$issue_id" || -z "$canonical_id" ]]; then
+        echo "Usage: taskstackai dup mark <issue-id> <canonical-id>" >&2
+        return 1
+    fi
+
+    local body
+    body=$(printf '{"duplicateOfId":"%s"}' "$canonical_id")
+
+    local result
+    result=$(_post "/issues/${issue_id}/mark-duplicate" -d "$body")
+
+    echo "$result" | _jq -r '"Marked \(.id) as duplicate of " + (.duplicateOfId // "unknown")'
+}
+
+cmd_dup_unmark() {
+    local issue_id="${1:-}"
+
+    if [[ -z "$issue_id" ]]; then
+        echo "Usage: taskstackai dup unmark <issue-id>" >&2
+        return 1
+    fi
+
+    local result
+    result=$(_post "/issues/${issue_id}/unmark-duplicate" -d '{}')
+
+    echo "$result" | _jq -r '"Unmarked \(.id) as duplicate. Status: \(.status)"'
+}
+
+cmd_orphan() {
+    local subcmd="${1:-help}"
+    shift 2>/dev/null || true
+    case "$subcmd" in
+        scan)     cmd_orphan_scan "$@" ;;
+        fix)      cmd_orphan_fix "$@" ;;
+        fix-all)  cmd_orphan_fix_all "$@" ;;
+        help|--help|-h)
+            echo "Usage: taskstackai orphan <subcommand>"
+            echo ""
+            echo "Subcommands:"
+            echo "  scan              Scan for orphaned references"
+            echo "  fix <type> <id>   Fix a single orphan (type: broken_parent|dangling_dependency|deleted_project)"
+            echo "  fix-all           Fix all detected orphans"
+            ;;
+        *)
+            echo "Unknown orphan subcommand: $subcmd" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_orphan_scan() {
+    local result
+    result=$(_get "/orphans")
+
+    echo "$result" | _jq -r '
+        if (.totalCount // 0) == 0 then "No orphans detected. All references are healthy."
+        else
+            "Found \(.totalCount) orphan(s) (scanned at \(.scannedAt))\n",
+            (.orphans[] |
+                "  [\(.orphanType | gsub("_";" "))]  \(.issueId)  \(.issueTitle // "<unknown>")  →  broken ref: \(.brokenRefId)" +
+                (if .dependencyId then "  (dep #\(.dependencyId))" else "" end)
+            )
+        end'
+}
+
+cmd_orphan_fix() {
+    local orphan_type="${1:-}"
+    local issue_id="${2:-}"
+
+    if [[ -z "$orphan_type" || -z "$issue_id" ]]; then
+        echo "Usage: taskstackai orphan fix <orphan_type> <issue_id> [--dep-id N] [--target-project ID]" >&2
+        return 1
+    fi
+
+    shift 2
+    local dep_id=""
+    local target_project=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dep-id)        dep_id="$2"; shift 2 ;;
+            --target-project) target_project="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    local body
+    body="{\"issueId\":\"${issue_id}\",\"orphanType\":\"${orphan_type}\",\"fixAction\":\"remove_ref\""
+    if [[ -n "$dep_id" ]]; then
+        body="${body},\"dependencyId\":${dep_id}"
+    fi
+    if [[ -n "$target_project" ]]; then
+        body="${body},\"fixAction\":\"reassign_project\",\"targetProjectId\":\"${target_project}\""
+    fi
+    body="${body}}"
+
+    local result
+    result=$(_post "/orphans/fix" -d "$body")
+
+    echo "$result" | _jq -r 'if .success then "Fixed: \(.message)" else "Failed: \(.message // .error)" end'
+}
+
+cmd_orphan_fix_all() {
+    local result
+    result=$(_post "/orphans/fix-all" -d '{}')
+
+    echo "$result" | _jq -r '"Fixed: \(.fixed), Failed: \(.failed)" + (if (.errors | length) > 0 then "\nErrors:\n" + (.errors[] | "  - \(.)") else "" end)'
+}
+
+cmd_setup() {
+    local api_key=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --key)  api_key="$2"; shift 2 ;;
+            *)      shift ;;
+        esac
+    done
+
+    if [[ -z "$api_key" ]]; then
+        echo "TaskStackAi Setup"
+        echo "================="
+        echo ""
+        echo "Enter your API key (from https://taskstackai.com/api-keys):"
+        read -r api_key
+    fi
+
+    if [[ -z "$api_key" ]]; then
+        echo "Error: API key cannot be empty." >&2
+        exit 1
+    fi
+
+    # Validate the key
+    local server="${TASKSTACKAI_SERVER:-https://taskstackai.com}"
+    local response
+    response=$(curl -s -S -X GET \
+        -H "Authorization: Bearer ${api_key}" \
+        -H "Accept: application/json" \
+        --fail-with-body \
+        "${server}/api/v1/projects" 2>/dev/null)
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Invalid API key or server unreachable." >&2
+        exit 1
+    fi
+
+    # Write config
+    mkdir -p .taskstackai
+    cat > .taskstackai/config <<CONF
+TASKSTACKAI_API_KEY="${api_key}"
+CONF
+
+    # Write AGENTS.md if it doesn't exist
+    if [[ ! -f "AGENTS.md" ]]; then
+        local plugin_dir
+        plugin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        local agents_template="${plugin_dir}/skills/taskstackai/resources/AGENTS.md"
+        if [[ -f "$agents_template" ]]; then
+            cp -f "$agents_template" AGENTS.md
+            echo "✓ Created AGENTS.md (AI agent instructions)"
+        fi
+    else
+        echo "• AGENTS.md already exists — skipping"
+    fi
+
+    # Append TaskStackAi block to CLAUDE.md if not already present
+    if [[ -f "CLAUDE.md" ]]; then
+        if ! grep -q "BEGIN TASKSTACKAI INTEGRATION" CLAUDE.md 2>/dev/null; then
+            cat >> CLAUDE.md <<'CLAUDEBLOCK'
+
+<!-- BEGIN TASKSTACKAI INTEGRATION v:2 -->
+## TaskStackAi Issue Tracker
+
+This project uses **TaskStackAi** for ALL issue tracking. Run `taskstackai prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+# Core workflow
+taskstackai ready                           # Find available work
+taskstackai show <id>                       # View issue details (--long for full)
+taskstackai claim <id>                      # Claim work
+taskstackai close <id> --reason "Done"      # Complete work
+taskstackai create "Title" -t task -p 2     # Create an issue
+taskstackai update <id> --title "New title" # Update fields inline
+taskstackai list                            # List all issues
+taskstackai search "query"                  # Full-text search
+
+# Dependencies
+taskstackai dep add <id> <depends-on-id>    # Add dependency
+taskstackai dep rm <id> <depends-on-id>     # Remove dependency
+
+# Epics
+taskstackai update <id> --type epic         # Promote issue to epic
+taskstackai epic subtask <epic-id> "Title"  # Create NEW subtask (takes a title, NOT an existing issue ID)
+taskstackai epic tree <epic-id>             # Show epic tree view
+
+# Labels & Comments
+taskstackai label add <issue-id> <label>    # Assign label to issue
+taskstackai comment add <id> "text"         # Add comment to issue
+```
+
+### Rules
+
+- Use `taskstackai` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `taskstackai prime` for detailed command reference and session close protocol
+- Always claim issues before starting work: `taskstackai claim <id>`
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END TASKSTACKAI INTEGRATION -->
+CLAUDEBLOCK
+            echo "✓ Appended TaskStackAi instructions to CLAUDE.md"
+        else
+            echo "• CLAUDE.md already has TaskStackAi integration — skipping"
+        fi
+    fi
+
+    # Add .taskstackai/ to .gitignore if not already there
+    if [[ -f ".gitignore" ]]; then
+        if ! grep -qx '.taskstackai/' .gitignore 2>/dev/null; then
+            echo '.taskstackai/' >> .gitignore
+        fi
+    else
+        echo '.taskstackai/' > .gitignore
+    fi
+
+    echo ""
+    echo "✓ Setup complete! Config saved to .taskstackai/config"
+    echo ""
+    echo "Try these commands:"
+    echo "  taskstackai ready      # see what's ready to work on"
+    echo "  taskstackai create     # create a new issue"
+    echo "  taskstackai list       # list all issues"
+}
+
+cmd_remove() {
+    echo "TaskStackAi Removal"
+    echo "==================="
+    echo ""
+
+    local removed=false
+
+    # Remove .taskstackai/ directory
+    if [[ -d ".taskstackai" ]]; then
+        rm -rf .taskstackai
+        echo "✓ Removed .taskstackai/ directory"
+        removed=true
+    fi
+
+    # Remove AGENTS.md if it mentions TaskStackAi
+    if [[ -f "AGENTS.md" ]] && grep -q "TaskStackAi" AGENTS.md 2>/dev/null; then
+        rm -f AGENTS.md
+        echo "✓ Removed AGENTS.md"
+        removed=true
+    fi
+
+    # Remove TaskStackAi block from CLAUDE.md
+    if [[ -f "CLAUDE.md" ]] && grep -q "BEGIN TASKSTACKAI INTEGRATION" CLAUDE.md 2>/dev/null; then
+        sed '/<!-- BEGIN TASKSTACKAI INTEGRATION/,/<!-- END TASKSTACKAI INTEGRATION -->/d' CLAUDE.md > CLAUDE.md.tmp && mv -f CLAUDE.md.tmp CLAUDE.md
+        echo "✓ Removed TaskStackAi integration from CLAUDE.md"
+        removed=true
+    fi
+
+    # Clean .taskstackai/ from .gitignore
+    if [[ -f ".gitignore" ]] && grep -q '.taskstackai/' .gitignore 2>/dev/null; then
+        grep -v '.taskstackai/' .gitignore > .gitignore.tmp && mv -f .gitignore.tmp .gitignore
+        echo "✓ Removed .taskstackai/ from .gitignore"
+        removed=true
+    fi
+
+    if $removed; then
+        echo ""
+        echo "✓ TaskStackAi has been removed from this project."
+    else
+        echo "Nothing to remove — TaskStackAi is not initialized in this directory."
+    fi
+}
+
+cmd_delete() {
+    local issue_id="${1:?Usage: taskstackai delete <issue-id>}"
+    _delete "/issues/${issue_id}" | _jq -r '"✓ Deleted issue: " + .id'
+}
+
+cmd_version() {
+    echo "taskstackai $TASKSTACKAI_VERSION (TaskStackAi CLI)"
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    cat <<'HELP'
+taskstackai - TaskStackAi CLI
+
+Usage: taskstackai <command> [options]
+
+Core Commands:
+  setup             Set up project config with API key
+  remove            Remove TaskStackAi from this project
+  prime             Show workflow context (for AI session start)
+  version           Show version
+
+Issue Tracking:
+  ready             Show unblocked issues ready to work
+  create            Create a new issue
+  show <id>         Show issue details (--long for full)
+  list              List/filter issues
+  update <id>       Update an issue
+  delete <id>       Delete an issue
+  close <id>        Close issue(s)
+  reopen <id>       Reopen a closed issue
+  claim <id>        Claim issue (assign + set in_progress)
+  search <query>    Full-text search
+  blocked           Show blocked issues
+
+Dependencies:
+  dep add           Add dependency between issues
+  dep rm            Remove dependency
+  dep blocks        Show what an issue blocks
+  dep blocked-by    Show what blocks an issue
+
+Epics:
+  epic list         List all epics
+  epic tree <id>    Show epic tree view
+  epic subtask      Create subtask under epic
+
+Labels:
+  label list        List all labels
+  label create      Create a label
+  label add         Assign label to issue
+  label rm          Remove label from issue
+  label delete      Delete a label
+
+Comments:
+  comment add       Add comment to issue
+  comment list      List comments on issue
+  comment edit      Edit a comment
+  comment delete    Delete a comment
+
+Events:
+  event list        Org-wide activity feed
+  event issue <id>  Events for a specific issue
+
+Dashboard:
+  dashboard stats      Project statistics
+  dashboard burndown   Burndown chart data
+  dashboard velocity   Velocity chart data
+  dashboard activity   Recent activity
+
+Data:
+  export            Export all issues to JSON
+  import <file>     Import issues from JSON
+
+Project:
+  project members   List project members
+  project invite    Invite a member to the project
+
+API Keys:
+  apikey list       List API keys
+  apikey create     Create new API key
+  apikey delete     Delete an API key
+  stats             Quick project stats
+
+Global Options:
+  --json            Output raw JSON
+  --help, -h        Show help
+
+Config: .taskstackai/config (API key stored in TASKSTACKAI_API_KEY)
+HELP
+}
+
+# ── Main dispatch ────────────────────────────────────────────────────────────
+
+_load_config "${1:-}"
+
+case "${1:-help}" in
+    setup)     shift; cmd_setup "$@" ;;
+    init)      shift; cmd_init "$@" ;;
+    remove)    shift; cmd_remove "$@" ;;
+    prime)     shift; cmd_prime "$@" ;;
+    ready)     shift; cmd_ready "$@" ;;
+    create)    shift; cmd_create "$@" ;;
+    show)      shift; cmd_show "$@" ;;
+    list)      shift; cmd_list "$@" ;;
+    update)    shift; cmd_update "$@" ;;
+    delete)    shift; cmd_delete "$@" ;;
+    close)     shift; cmd_close "$@" ;;
+    reopen)    shift; cmd_reopen "$@" ;;
+    claim)     shift; cmd_claim "$@" ;;
+    search)    shift; cmd_search "$@" ;;
+    stats)     shift; cmd_stats "$@" ;;
+    blocked)   shift; cmd_blocked "$@" ;;
+    dep)       shift; cmd_dep "$@" ;;
+    epic)      shift; cmd_epic "$@" ;;
+    label)     shift; cmd_label "$@" ;;
+    comment)   shift; cmd_comment "$@" ;;
+    event)     shift; cmd_event "$@" ;;
+    dashboard) shift; cmd_dashboard "$@" ;;
+    export)    shift; cmd_export "$@" ;;
+    import)    shift; cmd_import "$@" ;;
+    project)   shift; cmd_project "$@" ;;
+    apikey)    shift; cmd_apikey "$@" ;;
+    ie)        shift; cmd_ie "$@" ;;
+    # MVP-HIDDEN: org)       shift; cmd_org "$@" ;;
+    # MVP-HIDDEN: mol)       shift; cmd_mol "$@" ;;
+    # MVP-HIDDEN: swarm)     shift; cmd_swarm "$@" ;;
+    # MVP-HIDDEN: bond)      shift; cmd_bond "$@" ;;
+    # MVP-HIDDEN: orphan)    shift; cmd_orphan "$@" ;;
+    # MVP-HIDDEN: dup)       shift; cmd_dup "$@" ;;
+    version)   cmd_version ;;
+    help|--help|-h) cmd_help ;;
+    *)         echo "Unknown command: $1. Run 'taskstackai help' for usage." >&2; exit 1 ;;
+esac
