@@ -2483,49 +2483,57 @@ CONF
     # Append TaskStackAi block to CLAUDE.md if not already present
     if [[ -f "CLAUDE.md" ]]; then
         if ! grep -q "BEGIN TASKSTACKAI INTEGRATION" CLAUDE.md 2>/dev/null; then
-            cat >> CLAUDE.md <<'CLAUDEBLOCK'
+            local tsa_bin="${plugin_dir}/bin/taskstackai"
+            cat >> CLAUDE.md <<CLAUDEBLOCK
 
-<!-- BEGIN TASKSTACKAI INTEGRATION v:2 -->
+<!-- BEGIN TASKSTACKAI INTEGRATION v:3 -->
 ## TaskStackAi Issue Tracker
 
-This project uses **TaskStackAi** for ALL issue tracking. Run `taskstackai prime` to see full workflow context and commands.
+This project uses **TaskStackAi** for ALL issue tracking.
+
+### CLI Location
+
+The TaskStackAi CLI is located at: \`${tsa_bin}\`
+
+Run \`${tsa_bin} prime\` to see full workflow context and commands.
 
 ### Quick Reference
 
-```bash
+\`\`\`bash
 # Core workflow
-taskstackai ready                           # Find available work
-taskstackai show <id>                       # View issue details (--long for full)
-taskstackai claim <id>                      # Claim work
-taskstackai close <id> --reason "Done"      # Complete work
-taskstackai create "Title" -t task -p 2     # Create an issue
-taskstackai update <id> --title "New title" # Update fields inline
-taskstackai list                            # List all issues
-taskstackai search "query"                  # Full-text search
+${tsa_bin} ready                           # Find available work
+${tsa_bin} show <id>                       # View issue details (--long for full)
+${tsa_bin} claim <id>                      # Claim work
+${tsa_bin} close <id> --reason "Done"      # Complete work
+${tsa_bin} create "Title" -t task -p 2     # Create an issue
+${tsa_bin} update <id> --title "New title" # Update fields inline
+${tsa_bin} list                            # List all issues
+${tsa_bin} search "query"                  # Full-text search
 
 # Dependencies
-taskstackai dep add <id> <depends-on-id>    # Add dependency
-taskstackai dep rm <id> <depends-on-id>     # Remove dependency
+${tsa_bin} dep add <id> <depends-on-id>    # Add dependency
+${tsa_bin} dep rm <id> <depends-on-id>     # Remove dependency
 
 # Epics
-taskstackai update <id> --type epic         # Promote issue to epic
-taskstackai epic subtask <epic-id> "Title"  # Create NEW subtask (takes a title, NOT an existing issue ID)
-taskstackai epic tree <epic-id>             # Show epic tree view
+${tsa_bin} update <id> --type epic         # Promote issue to epic
+${tsa_bin} epic subtask <epic-id> "Title"  # Create NEW subtask (takes a title, NOT an existing issue ID)
+${tsa_bin} epic tree <epic-id>             # Show epic tree view
 
 # Labels & Comments
-taskstackai label add <issue-id> <label>    # Assign label to issue
-taskstackai comment add <id> "text"         # Add comment to issue
-```
+${tsa_bin} label add <issue-id> <label>    # Assign label to issue
+${tsa_bin} comment add <id> "text"         # Add comment to issue
+\`\`\`
 
 ### Rules
 
-- Use `taskstackai` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `taskstackai prime` for detailed command reference and session close protocol
-- Always claim issues before starting work: `taskstackai claim <id>`
+- **TICKET FIRST** — Before writing ANY code, you MUST create or claim a TaskStackAi issue. No exceptions. If the user asks you to fix a bug, add a feature, or make any code change, create an issue first with \`${tsa_bin} create\`, then claim it with \`${tsa_bin} claim <id>\`, THEN start coding. Close the issue when the work is done.
+- Use \`${tsa_bin}\` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run \`${tsa_bin} prime\` for detailed command reference and session close protocol
+- Always claim issues before starting work: \`${tsa_bin} claim <id>\`
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until \`git push\` succeeds.
 
 **MANDATORY WORKFLOW:**
 
@@ -2533,17 +2541,17 @@ taskstackai comment add <id> "text"         # Add comment to issue
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
 4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
+   \`\`\`bash
    git pull --rebase
    git push
    git status  # MUST show "up to date with origin"
-   ```
+   \`\`\`
 5. **Clean up** - Clear stashes, prune remote branches
 6. **Verify** - All changes committed AND pushed
 7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
+- Work is NOT complete until \`git push\` succeeds
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
 - If push fails, resolve and retry until it succeeds
