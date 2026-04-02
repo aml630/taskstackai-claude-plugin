@@ -9,7 +9,7 @@ If no file path is provided, ask the user for one.
 
 Run:
 ```
-taskstackai import <file>
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai import <file>
 ```
 
 Confirm the import results after the command completes, including how many issues were imported.

@@ -6,7 +6,7 @@ Display the current version of the taskstackai CLI tool.
 
 Run:
 ```
-taskstackai version
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai version
 ```
 
 Show the version number to the user.

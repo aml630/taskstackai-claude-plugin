@@ -9,7 +9,7 @@ If no issue ID is provided, ask for one.
 
 Run:
 ```
-taskstackai reopen <id>
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai reopen <id>
 ```
 
 Confirm the issue has been reopened after the command completes.

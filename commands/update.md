@@ -11,7 +11,7 @@ Supported flags: `--title`, `--type`, `--priority`, `--status`, `--description`,
 
 Run:
 ```
-taskstackai update <id> --<field> <value> [--<field2> <value2> ...]
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai update <id> --<field> <value> [--<field2> <value2> ...]
 ```
 
 Confirm the update after it completes by showing what changed.

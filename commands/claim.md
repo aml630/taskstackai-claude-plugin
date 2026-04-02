@@ -9,7 +9,7 @@ If no issue ID is provided, ask for one.
 
 Run:
 ```
-taskstackai claim <id>
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai claim <id>
 ```
 
 Confirm the claim after the command completes. Suggest the user can now start working and use `/close` when done.

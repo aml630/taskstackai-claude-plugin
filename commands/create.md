@@ -12,7 +12,7 @@ Priority is 1 (highest) through 4 (lowest). Default to 2 if not specified.
 
 Run:
 ```
-taskstackai create --title "<title>" --type <type> --priority <priority> --json
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai create --title "<title>" --type <type> --priority <priority> --json
 ```
 
 If the user provided a description, add `--description "<description>"`.

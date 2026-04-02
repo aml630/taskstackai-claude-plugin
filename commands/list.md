@@ -9,7 +9,7 @@ Build the command from the user's arguments. Supported filters include `--status
 
 Run:
 ```
-taskstackai list [filters...]
+${CLAUDE_PLUGIN_DIR}/bin/taskstackai list [filters...]
 ```
 
-If no filters are given, run `taskstackai list` to show all open issues. Present results in a readable table or list format.
+If no filters are given, run `${CLAUDE_PLUGIN_DIR}/bin/taskstackai list` to show all open issues. Present results in a readable table or list format.
