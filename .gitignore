@@ -4,3 +4,10 @@
 
 /.vs
 /skills/walkthrough-recorder
+.taskstackai/
+.env
+.env.*
+*.key
+*.pem
+credentials.json
+secrets.json
