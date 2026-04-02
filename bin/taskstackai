@@ -210,14 +210,14 @@ cmd_create() {
     local json_flag=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --title|-t)       title="$2"; shift 2 ;;
+            --title)          title="$2"; shift 2 ;;
             --description|-d) description="$2"; shift 2 ;;
-            --type)           type="$2"; shift 2 ;;
+            --type|-t)        type="$2"; shift 2 ;;
             --priority|-p)    priority="$2"; shift 2 ;;
             --assignee)       assignee="$2"; shift 2 ;;
             --parent)         parent="$2"; shift 2 ;;
             --json)           json_flag=true; shift ;;
-            --help|-h)        echo "Usage: taskstackai create --title \"...\" [--type task] [--priority 2] [--description \"...\"] [--assignee id] [--parent id] [--json]"; return 0 ;;
+            --help|-h)        echo "Usage: taskstackai create --title \"...\" [-t type] [-p priority] [-d \"...\"] [--assignee id] [--parent id] [--json]"; return 0 ;;
             *)
                 # Positional: first is title
                 if [[ -z "$title" ]]; then
@@ -2505,7 +2505,7 @@ ${tsa_bin} ready                           # Find available work
 ${tsa_bin} show <id>                       # View issue details (--long for full)
 ${tsa_bin} claim <id>                      # Claim work
 ${tsa_bin} close <id> --reason "Done"      # Complete work
-${tsa_bin} create "Title" -t task -p 2     # Create an issue
+${tsa_bin} create --title "Title" -t task -p 2  # Create an issue
 ${tsa_bin} update <id> --title "New title" # Update fields inline
 ${tsa_bin} list                            # List all issues
 ${tsa_bin} search "query"                  # Full-text search
